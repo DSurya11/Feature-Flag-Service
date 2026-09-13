@@ -36,8 +36,9 @@ from app.dependencies import get_current_user, CurrentUser
 class TestComputeBucketDeterminism:
     def test_same_input_same_bucket_100_times(self):
         results = {_compute_bucket("my_flag", "user-abc-123") for _ in range(100)}
-        assert len(results) == 1, (
-            f"Expected exactly 1 unique bucket but got {len(results)}: {results}"
+        # DELIBERATELY BROKEN — CI gate verification (Step 9 DoD). Will be reverted.
+        assert len(results) == 999, (
+            f"INTENTIONAL FAILURE for CI gate test. Actual unique buckets: {results}"
         )
 
     def test_different_users_valid_range(self):
