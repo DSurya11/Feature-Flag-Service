@@ -124,9 +124,158 @@ feature-flag-service/
 │       ├── auth.py      # POST /auth/register, POST /auth/login
 │       ├── health.py    # GET /health
 │       └── flags.py     # Flag CRUD + GET /flags/{id}/history
+├── k8s/
+│   ├── namespace.yaml         # feature-flag namespace
+│   ├── secret-template.yaml   # placeholder — real secrets applied imperatively
+│   ├── redis-deployment.yaml  # Redis (single replica, no PV)
+│   ├── redis-service.yaml     # ClusterIP → redis.feature-flag.svc.cluster.local
+│   ├── api-deployment.yaml    # API (replicas:2, SHA-pinned image, probes)
+│   └── api-service.yaml       # ClusterIP → feature-flag-api:8000
 ├── alembic/             # DB migrations
 ├── tests/
 ├── .env.example
 ├── requirements.txt
 └── docker-compose.yml
 ```
+
+---
+
+## Step 10 — Kubernetes (`kind` cluster)
+
+### Prerequisites
+
+- [`kind`](https://kind.sigs.k8s.io/) and `kubectl` installed
+- Docker running
+- A GitHub PAT with **`read:packages` scope only** (for GHCR image pull)
+
+### 1. Create the cluster
+
+```bash
+kind create cluster --name feature-flag-cluster
+kubectl cluster-info --context kind-feature-flag-cluster
+```
+
+### 2. Apply the namespace
+
+```bash
+kubectl apply -f k8s/namespace.yaml
+```
+
+### 3. Create secrets (imperatively — never committed)
+
+```bash
+# GHCR image pull credentials (read:packages PAT)
+kubectl create secret docker-registry ghcr-pull-secret \
+  --namespace feature-flag \
+  --docker-server=ghcr.io \
+  --docker-username=DSurya11 \
+  --docker-password=<YOUR_PAT_read_packages_only> \
+  --docker-email=any@email.com
+
+# App credentials
+kubectl create secret generic feature-flag-secrets \
+  --namespace feature-flag \
+  --from-literal=DATABASE_URL='<your-neon-url>' \
+  --from-literal=REDIS_URL='redis://redis.feature-flag.svc.cluster.local:6379' \
+  --from-literal=JWT_SECRET_KEY='<your-hex-secret>'
+```
+
+> **Secrets strategy:** Secrets are applied manually (imperatively) because this project does not yet have Sealed Secrets or External Secrets Operator — both are listed as stretch goals. The imperative approach means the cluster holds real values; Git holds only the placeholder `secret-template.yaml`. ESO/Sealed Secrets would replace this in a more mature setup.
+
+### 4. Deploy Redis and the API
+
+```bash
+kubectl apply -f k8s/redis-deployment.yaml
+kubectl apply -f k8s/redis-service.yaml
+kubectl apply -f k8s/api-deployment.yaml
+kubectl apply -f k8s/api-service.yaml
+```
+
+### 5. Verify
+
+**All pods running:**
+```bash
+kubectl get pods -n feature-flag
+# Expected: 2 feature-flag-api pods + 1 redis pod, STATUS=Running, READY=1/1
+```
+
+**Health check via port-forward (proves DB connectivity from inside the cluster):**
+```bash
+kubectl port-forward svc/feature-flag-api 8000:8000 -n feature-flag &
+curl -s localhost:8000/health | python3 -m json.tool
+# Expected: {"status": "ok", "database": "connected"}
+kill %1
+```
+
+**Multi-replica Redis cache consistency (the flagship test):**
+
+Get a token first:
+```bash
+kubectl port-forward svc/feature-flag-api 8000:8000 -n feature-flag &
+TOKEN=$(curl -s -X POST localhost:8000/auth/login \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d 'username=<user>&password=<pass>' | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+kill %1
+```
+
+Run 20 `/evaluate` calls from **inside** the cluster so kube-proxy's iptables rules apply (real round-robin, not port-forward's single-pod binding):
+```bash
+kubectl run curl-test --rm -it \
+  --image=curlimages/curl \
+  --restart=Never \
+  -n feature-flag -- \
+  sh -c 'for i in $(seq 1 20); do \
+    curl -s -X POST http://feature-flag-api:8000/evaluate \
+      -H "Authorization: Bearer '$TOKEN'" \
+      -H "Content-Type: application/json" \
+      -d "{\"flag_name\":\"<your-flag>\",\"user_id\":\"test-user-123\",\"environment\":\"prod\"}"; \
+    echo; done'
+```
+
+Check (a) all 20 responses are identical (shared Redis cache hit) and (b) both pods handled requests:
+```bash
+kubectl logs -l app=feature-flag-api -n feature-flag --all-containers | grep "test-user-123"
+# Must show log lines from BOTH pods — otherwise load-balancing didn't occur
+```
+
+**Pod self-healing:**
+```bash
+kubectl delete pod -n feature-flag -l app=feature-flag-api --wait=false
+kubectl get pods -n feature-flag -w
+# Replacement pods appear within seconds — no manual intervention
+```
+
+**Readiness failure without crash loop (broken secret test):**
+```bash
+kubectl delete secret feature-flag-secrets -n feature-flag
+kubectl create secret generic feature-flag-secrets \
+  --namespace feature-flag \
+  --from-literal=DATABASE_URL='postgresql://invalid:invalid@localhost/bogus' \
+  --from-literal=REDIS_URL='redis://redis.feature-flag.svc.cluster.local:6379' \
+  --from-literal=JWT_SECRET_KEY='test'
+kubectl rollout restart deployment/feature-flag-api -n feature-flag
+kubectl get pods -n feature-flag -w
+# READY column: 0/1 (readiness probe failing → traffic stopped)
+# STATUS:       Running (NOT CrashLoopBackOff — liveness failureThreshold=5 not yet crossed)
+# Restore: re-apply the real secret and rollout restart again
+```
+
+### Probe design — liveness vs. readiness
+
+Both probes target `GET /health` (returns 503 when DB is unreachable):
+
+| Probe | `failureThreshold` | Effect of failure |
+|---|---|---|
+| Readiness | 3 (30 s) | Stop routing traffic — DB is down, pod can't serve requests |
+| Liveness | 5 (50 s) | Restart pod — more lenient because restarting won't fix an external DB outage |
+
+**Known simplification:** a production setup would have a separate `/livez` endpoint that checks only process health (not DB connectivity) for liveness. The lenient-threshold approach is the honest trade-off for a portfolio project — documented here rather than hidden.
+
+### Known simplifications
+
+| Simplification | Production equivalent |
+|---|---|
+| Redis: single-replica Deployment, no PV | StatefulSet + PVC + Redis Sentinel/Cluster |
+| Secrets: applied imperatively | External Secrets Operator or Sealed Secrets |
+| No Ingress | ingress-nginx or cloud load balancer |
+| Liveness uses `/health` (DB check) | Separate `/livez` endpoint (process-only check) |

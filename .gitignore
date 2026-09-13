@@ -37,3 +37,10 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# Kubernetes — never commit filled-in secret manifests
+# secret-template.yaml (with <REPLACE_ME> values) is committed; any file
+# with real values should be named differently and caught by these patterns.
+k8s/secret.yaml
+k8s/*-real.yaml
+k8s/*-secrets.yaml
