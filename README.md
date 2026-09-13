@@ -279,3 +279,8 @@ Both probes target `GET /health` (returns 503 when DB is unreachable):
 | Secrets: applied imperatively | External Secrets Operator or Sealed Secrets |
 | No Ingress | ingress-nginx or cloud load balancer |
 | Liveness uses `/health` (DB check) | Separate `/livez` endpoint (process-only check) |
+
+## Step 11 — Terraform
+
+Terraform manages the existing Neon project via `terraform import`, adopting an already-provisioned resource rather than creating a new one — this mirrors real-world 'brownfield' infrastructure adoption. Terraform state is stored locally for this project; a production setup would use a remote backend (e.g. Terraform Cloud or S3 with locking) for team/CI use. Terraform's scope here covers the Neon project itself; a full AWS RDS-based setup would additionally require VPC, subnet, and security-group resources, which are out of scope given the Neon-based architecture chosen in Step 1 for cost reasons.
+
