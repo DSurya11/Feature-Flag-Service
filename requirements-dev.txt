@@ -1,0 +1,9 @@
+# Dev/test-only dependencies — NOT installed in the production Docker image.
+# Install in CI via: pip install -r requirements-dev.txt
+# Install locally via: pip install -r requirements.txt -r requirements-dev.txt
+
+# Test runner
+pytest
+
+# Required by FastAPI's TestClient (Starlette 0.20+ dependency)
+httpx

@@ -99,10 +99,15 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Step 3 — Install dependencies.
-      # --no-cache-dir keeps the runner's disk usage predictable.
-      - name: Install dependencies
+      # Step 3 — Install runtime + dev dependencies.
+      # requirements.txt — runtime deps, same as what the Dockerfile installs.
+      # requirements-dev.txt — test-only deps (pytest, httpx for TestClient).
+      # These are split so the Dockerfile never installs pytest into the image.
+      - name: Install runtime dependencies
         run: pip install --no-cache-dir -r requirements.txt
+
+      - name: Install dev/test dependencies
+        run: pip install --no-cache-dir -r requirements-dev.txt
 
       # Step 4 — Provide environment variables for this job.
       # These point at the ephemeral service containers defined above.
