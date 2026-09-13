@@ -284,3 +284,23 @@ Both probes target `GET /health` (returns 503 when DB is unreachable):
 
 Terraform manages the existing Neon project via `terraform import`, adopting an already-provisioned resource rather than creating a new one — this mirrors real-world 'brownfield' infrastructure adoption. Terraform state is stored locally for this project; a production setup would use a remote backend (e.g. Terraform Cloud or S3 with locking) for team/CI use. Terraform's scope here covers the Neon project itself; a full AWS RDS-based setup would additionally require VPC, subnet, and security-group resources, which are out of scope given the Neon-based architecture chosen in Step 1 for cost reasons.
 
+---
+
+## Step 13 — GitOps (Argo CD)
+
+Argo CD handles automated synchronization of Kubernetes manifests from the `feature-flag-service-env-config` repository to the cluster.
+
+- **Automated Sync & Prune:** If a manifest is deleted from Git, the resource is deleted from the cluster.
+- **Self-Healing:** Manual drifts (e.g., `kubectl scale deployment ... --replicas=5`) are automatically detected and reverted back to the Git-declared state (e.g., `replicas: 2`).
+
+### ⚠️ GitOps Failure Mode Lesson: The Secret Template Trap
+
+During initial GitOps deployment, a critical failure mode was observed: the pods crashed with `CreateContainerConfigError` due to missing valid secrets, even though real secrets were manually created in the cluster (as per the *Secrets strategy* in Step 10). 
+
+**What went wrong:** 
+The repository contained a file named `secret-template.yaml` intended only for documentation. However, because the file contained valid YAML with `kind: Secret`, Argo CD parsed it as a real manifest. It synced the template into the cluster, silently overwriting the real application secrets with `<REPLACE_ME>` placeholder values.
+
+**The Lesson:**
+Argo CD's manifest scanner looks at the contents of the files in its watched path, not the filenames. Anything with a valid Kubernetes `kind:` is treated as a target state to enforce. 
+**Fixing this:** Renaming the file to `secret-template.yaml.example` prevents Argo CD from parsing it as a `.yaml` manifest, effectively defusing the trap. This is a common GitOps pitfall where documentation or local test manifests inadvertently destroy production state if left in the sync path.
+
