@@ -257,3 +257,16 @@ jobs:
           echo ""
           echo "NOTE: For Argo CD (Step 10+), reference the SHA tag above —"
           echo "never the 'latest' tag, which moves on every push."
+
+      - name: Update image tag in env-config repo
+        env:
+          GH_TOKEN: ${{ secrets.ENV_CONFIG_REPO_PAT }}
+        run: |
+          git clone https://x-access-token:${GH_TOKEN}@github.com/DSurya11/feature-flag-service-env-config.git env-config
+          cd env-config
+          sed -i "s|image: ghcr.io/dsurya11/feature-flag-service:.*|image: ghcr.io/dsurya11/feature-flag-service:${{ github.sha }}|" api-deployment.yaml
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add api-deployment.yaml
+          git commit -m "chore: update image to ${{ github.sha }}" || echo "No changes to commit"
+          git push origin main
