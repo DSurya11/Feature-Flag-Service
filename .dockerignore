@@ -1,0 +1,72 @@
+# .dockerignore — controls what is sent to the Docker build context
+#
+# Why this matters:
+#   Everything NOT listed here is sent to the Docker daemon when you run
+#   `docker build .`.  Large directories (like .venv) bloat the build context
+#   and slow every build.  Sensitive files (like .env) must NEVER enter the
+#   build context — if they do, they could end up in image layers even if your
+#   Dockerfile never explicitly COPYs them.
+#
+# Rule of thumb: exclude anything that isn't needed to build and run the app.
+
+# -------------------------------------------------------------------
+# Python artefacts — generated at runtime or install time, not source
+# -------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.venv/
+venv/
+env/
+ENV/
+
+# -------------------------------------------------------------------
+# Credentials & secrets
+# The real .env file must NEVER reach the Docker daemon or end up in
+# an image layer.  Secrets are injected at run time via environment
+# variables (docker-compose `env_file:` / `environment:` or
+# `docker run -e`).  .env.example is safe to include (no real values).
+# -------------------------------------------------------------------
+.env
+
+# -------------------------------------------------------------------
+# Test infrastructure
+# Excluded from the production runtime image — it doesn't need them.
+# If containerised test runs are needed in CI (Step 9), that's a
+# separate build target, not this runtime image.
+# -------------------------------------------------------------------
+tests/
+.pytest_cache/
+*.db
+htmlcov/
+.coverage
+
+# -------------------------------------------------------------------
+# Version control
+# -------------------------------------------------------------------
+.git/
+.gitignore
+.github/
+
+# -------------------------------------------------------------------
+# Infrastructure / tooling that isn't needed inside the container
+# -------------------------------------------------------------------
+terraform/
+scripts/
+
+# -------------------------------------------------------------------
+# Editor / OS noise
+# -------------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# -------------------------------------------------------------------
+# Docs
+# -------------------------------------------------------------------
+README.md

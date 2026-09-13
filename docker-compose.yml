@@ -1,0 +1,106 @@
+# docker-compose.yml — local development full stack
+#
+# History:
+#   Step 6: Added `redis` service so the app's cache layer could run locally.
+#           App itself still ran via `uvicorn` directly on the host.
+#   Step 8: Added `api` service — the app now runs inside a container too.
+#           This proves portability: the exact same image CI (Step 9) will
+#           build and Kubernetes (Step 10+) will run as a pod.
+#
+# Usage:
+#   docker compose up -d              # bring up both services
+#   docker compose up --build         # rebuild the api image first, then start
+#   docker compose logs -f api        # follow api logs
+#   docker compose down               # stop and remove containers
+#   docker compose down -v            # also remove named volumes (clears Redis data)
+#
+# Postgres / Neon:
+#   Postgres is intentionally absent from this compose file.
+#   The app connects to Neon (managed cloud Postgres) which is always reachable
+#   over the internet — there is nothing to spin up locally.  DATABASE_URL is
+#   injected from the host's .env file (via `env_file: .env` on the api service)
+#   and passes straight through to Neon's TLS endpoint.
+#   This is a deliberate architecture choice: Neon handles backups, HA, and
+#   connection pooling; running a local Postgres container alongside would add
+#   complexity without benefit for this project.
+#   If you ever need a fully offline stack (e.g. for integration tests with no
+#   external network), add a postgres service here with a healthcheck and update
+#   DATABASE_URL accordingly — but that's a separate concern from this step.
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Redis — cache layer (added in Step 6, unchanged here)
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: feature-flag-redis
+    ports:
+      - "6379:6379"
+    # Persist data across restarts so a container restart during local
+    # development doesn't silently empty the cache mid-session.
+    volumes:
+      - redis_data:/data
+    # Healthcheck used by the api service's `depends_on: condition: service_healthy`.
+    # Without a healthcheck, `depends_on` only waits for the container to
+    # *start* — not for Redis to actually be ready to accept connections.
+    # This healthcheck ensures the api container only starts after Redis
+    # confirms it's ready via a successful PING → PONG.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # API — the feature-flag-service itself (added in Step 8)
+  # ---------------------------------------------------------------------------
+  api:
+    build: .
+    # Rebuild with: docker compose up --build
+    # In CI (Step 9) this becomes a push to GHCR; compose references the
+    # pre-built image.  During local dev, `build: .` keeps the loop tight.
+    container_name: feature-flag-api
+    ports:
+      - "8000:8000"
+    # `env_file` loads the host's .env file, supplying:
+    #   DATABASE_URL    → Neon connection string (TLS)
+    #   JWT_SECRET_KEY  → signing secret for tokens
+    #   JWT_ALGORITHM, JWT_EXPIRE_MINUTES, CACHE_TTL_SECONDS, LOG_LEVEL
+    #
+    # .env is listed in .dockerignore so it NEVER enters the image itself —
+    # it is only read by docker-compose at `up` time and injected as runtime
+    # environment variables.  No secrets are baked into the image layers.
+    env_file:
+      - .env
+    environment:
+      # --- REDIS_URL override (critical, read carefully) ---
+      # The host's .env contains REDIS_URL=redis://localhost:6379, which is
+      # correct when running uvicorn directly on the host machine.
+      # WRONG inside docker-compose: `localhost` inside the api container
+      # refers to the api container itself — the Redis container is not there.
+      # The `redis` service is reachable via its service name on docker-compose's
+      # internal bridge network.  This environment: block overrides the value
+      # from env_file, so the api container always uses the correct hostname.
+      # If you get this wrong, the app will hit "Redis unreachable" errors that
+      # look identical to a real outage — the most common docker-compose
+      # networking mistake, so it's called out explicitly here.
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      redis:
+        # `condition: service_healthy` waits for Redis's healthcheck above to
+        # pass before starting the api container.  A bare `depends_on: redis`
+        # only waits for the container to start (a few milliseconds) — Redis
+        # itself may not yet be ready to accept connections.  Using the healthy
+        # condition prevents the api's startup Redis ping from failing simply
+        # because Redis was still initialising.
+        condition: service_healthy
+    # Restart policy: restart the api container automatically unless you
+    # explicitly stop it.  This means a container crash during local dev
+    # self-heals without manual intervention, and the stack survives a host
+    # reboot with `docker compose up -d`.  This mirrors Kubernetes' default
+    # restart behaviour (RestartPolicy: Always on Deployments).
+    restart: unless-stopped
+
+volumes:
+  redis_data:

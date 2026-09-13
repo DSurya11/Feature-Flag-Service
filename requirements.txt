@@ -1,0 +1,11 @@
+sqlalchemy
+alembic
+psycopg2-binary
+python-dotenv
+fastapi
+uvicorn[standard]
+python-jose[cryptography]
+bcrypt
+python-multipart
+redis
+prometheus-client
