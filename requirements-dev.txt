@@ -5,5 +5,5 @@
 # Test runner
 pytest
 
-# Required by FastAPI's TestClient (Starlette 0.20+ dependency)
-httpx
+# Required by FastAPI's TestClient (Starlette now requires httpx2, not httpx)
+httpx2

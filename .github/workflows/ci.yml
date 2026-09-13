@@ -122,6 +122,11 @@ jobs:
           echo "REDIS_URL=redis://localhost:6379" >> $GITHUB_ENV
           echo "JWT_SECRET_KEY=ci-throwaway-key-not-used-in-production" >> $GITHUB_ENV
           echo "ACCESS_TOKEN_EXPIRE_MINUTES=30" >> $GITHUB_ENV
+          # PYTHONPATH=. makes `from app.xxx import ...` resolvable from the
+          # project root.  Without this, pytest on the CI runner cannot find
+          # the `app` package because it isn't installed — it's just a directory.
+          # This matches what happens locally when pytest is run from the repo root.
+          echo "PYTHONPATH=$GITHUB_WORKSPACE" >> $GITHUB_ENV
 
       # Step 5 — Run Alembic migrations against the fresh, empty ephemeral
       # Postgres.  This is a dual-purpose step:
