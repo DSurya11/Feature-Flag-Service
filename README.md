@@ -177,7 +177,6 @@ Swagger UI: [http://localhost:8000/docs](http://localhost:8000/docs)
 
 | Method   | Path                     | Auth    | Description                              |
 |----------|--------------------------|---------|------------------------------------------|
-| `POST`   | `/auth/register`         | —       | Register a new user                      |
 | `POST`   | `/auth/login`            | —       | Obtain a JWT (Bearer token)              |
 | `GET`    | `/health`                | —       | Liveness check                           |
 | `POST`   | `/flags`                 | admin   | Create a feature flag                    |
@@ -192,7 +191,6 @@ Swagger UI: [http://localhost:8000/docs](http://localhost:8000/docs)
 ## Flag Types
 
 | `flag_type`    | `rollout_percentage` | Notes                                         |
-|----------------|----------------------|-----------------------------------------------|
 | `boolean`      | must be absent       | Simple on/off flag                            |
 | `targeted`     | must be absent       | Evaluated against targeting rules             |
 | `percentage`   | **required** (0–100) | Deterministic hash-based rollout              |
@@ -220,7 +218,6 @@ The service exposes four Prometheus metrics at `GET /metrics` in standard text e
 ## Error Responses
 
 | Scenario                              | HTTP Status | Notes                                      |
-|---------------------------------------|-------------|--------------------------------------------|
 | Missing / invalid JWT                 | 401         | `WWW-Authenticate: Bearer` header included |
 | Valid JWT, wrong role                 | 403         | —                                          |
 | Resource not found                    | 404         | Message identifies what was missing        |
@@ -247,7 +244,7 @@ feature-flag-service/
 │   ├── audit.py         # Shared audit_log insert helper
 │   ├── dependencies.py  # get_current_user, require_admin FastAPI deps
 │   └── routers/
-│       ├── auth.py      # POST /auth/register, POST /auth/login
+│       ├── auth.py      # POST /auth/login
 │       ├── health.py    # GET /health
 │       └── flags.py     # Flag CRUD + GET /flags/{id}/history
 ├── k8s/
