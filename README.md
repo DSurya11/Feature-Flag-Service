@@ -95,7 +95,7 @@ By splitting the internal timing in a debug deployment, we confirmed the exact r
 - **Cache lookups (Redis)** take ~0.6 milliseconds.
 - **Database fetches (Neon Postgres)** take ~750ms-800ms on every single request.
 
-The burst timing confirms there is no "cold-start" improvement on subsequent requests. Because the FastAPI app uses SQLAlchemy's default connection pooling without explicit tuning (and no intermediate PgBouncer), a heavy TLS connection/handshake to the remote serverless Postgres DB occurs constantly. The cache is blazing fast, but the underlying DB round-trip is the confirmed bottleneck. 
+Every request paid the full ~780ms connection-establishment cost uniformly, with no warm-up improvement across a tight burst — indicating the connection pool isn't being effectively reused between requests, despite SQLAlchemy's default `QueuePool` being in place. The exact mechanism wasn't fully isolated in this pass, but the `-pooler` hostname in the `DATABASE_URL` confirms we are already routing through Neon's built-in PgBouncer endpoint. This suggests the overhead might be tied to per-connection SSL/TLS negotiation costs, or a session lifecycle issue preventing the pool from maintaining warm connections. The cache is blazing fast, but the underlying DB round-trip is the confirmed bottleneck. 
 
 This is a genuinely useful finding: it's the actual measured answer to the original spec's "sub-50ms" requirement, and it demonstrates exactly why that requirement needs real instrumentation to verify rather than being assumed.
 
