@@ -113,6 +113,23 @@ class FlagUpdate(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# TargetingRule — request/response for /flags/{id}/rules
+# ---------------------------------------------------------------------------
+
+class TargetingRuleCreate(BaseModel):
+    attribute: str = Field(..., description="The user attribute to match (e.g. 'plan', 'country')")
+    operator: str = Field(..., pattern=r"^(equals|in|not_equals)$")
+    value: str = Field(..., description="The value to match against. For 'in', use comma-separated values.")
+
+
+class TargetingRuleResponse(TargetingRuleCreate):
+    id: int
+    flag_id: int
+
+    model_config = {"from_attributes": True}
+
+
+# ---------------------------------------------------------------------------
 # FlagResponse — used as the response body for all flag read/write endpoints
 # ---------------------------------------------------------------------------
 
@@ -133,6 +150,7 @@ class FlagResponse(BaseModel):
     environment: str
     created_at: datetime
     updated_at: datetime
+    targeting_rules: list[TargetingRuleResponse] = []
 
     model_config = {"from_attributes": True}
 

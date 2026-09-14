@@ -48,8 +48,8 @@ from app.cache import invalidate_cached_flag
 from app.database import get_db
 from app.dependencies import CurrentUser, get_current_user, require_admin
 from app.metrics import flag_mutations_total
-from app.models import AuditLog, Flag
-from app.schemas import AuditLogEntry, FlagCreate, FlagResponse, FlagUpdate
+from app.models import AuditLog, Flag, TargetingRule
+from app.schemas import AuditLogEntry, FlagCreate, FlagResponse, FlagUpdate, TargetingRuleCreate, TargetingRuleResponse
 
 logger = logging.getLogger(__name__)
 
@@ -498,3 +498,123 @@ def get_flag_history(
         .all()
     )
     return entries
+
+
+# ---------------------------------------------------------------------------
+# POST /flags/{id}/rules — add targeting rule
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/{flag_id}/rules",
+    response_model=TargetingRuleResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Add a targeting rule to a feature flag",
+)
+def create_targeting_rule(
+    flag_id: int,
+    body: TargetingRuleCreate,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(require_admin),
+) -> TargetingRule:
+    flag = _get_flag_or_404(db, flag_id)
+    if flag.flag_type != "targeted":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Targeting rules can only be added to flags of type 'targeted'.",
+        )
+
+    rule = TargetingRule(
+        flag_id=flag.id,
+        attribute=body.attribute,
+        operator=body.operator,
+        value=body.value,
+    )
+    
+    old_snap = _snapshot(flag)
+
+    try:
+        db.add(rule)
+        db.flush()
+
+        record_audit(
+            db,
+            flag=flag,
+            action="updated",
+            actor=current_user.username,
+            old_state=old_snap,
+            new_state=flag,
+        )
+
+        db.commit()
+        db.refresh(rule)
+    except Exception:
+        db.rollback()
+        logger.exception("Unexpected error creating targeting rule for flag id=%s", flag_id)
+        raise
+
+    logger.info("Targeting rule created: id=%s flag_id=%s actor=%s", rule.id, flag.id, current_user.username)
+    invalidate_cached_flag(flag.name, flag.environment)
+
+    try:
+        flag_mutations_total.labels(action="updated").inc()
+    except Exception:  # noqa: BLE001
+        pass
+
+    return rule
+
+
+# ---------------------------------------------------------------------------
+# DELETE /flags/{id}/rules/{rule_id} — delete targeting rule
+# ---------------------------------------------------------------------------
+
+@router.delete(
+    "/{flag_id}/rules/{rule_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a targeting rule from a feature flag",
+)
+def delete_targeting_rule(
+    flag_id: int,
+    rule_id: int,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(require_admin),
+) -> None:
+    flag = _get_flag_or_404(db, flag_id)
+    
+    rule = db.query(TargetingRule).filter(TargetingRule.id == rule_id, TargetingRule.flag_id == flag_id).first()
+    if rule is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Targeting rule {rule_id} not found for flag {flag_id}.",
+        )
+
+    old_snap = _snapshot(flag)
+
+    try:
+        db.delete(rule)
+        db.flush()
+
+        record_audit(
+            db,
+            flag=flag,
+            action="updated",
+            actor=current_user.username,
+            old_state=old_snap,
+            new_state=flag,
+        )
+
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Unexpected error deleting targeting rule id=%s", rule_id)
+        raise
+
+    logger.info("Targeting rule deleted: id=%s flag_id=%s actor=%s", rule_id, flag.id, current_user.username)
+    invalidate_cached_flag(flag.name, flag.environment)
+
+    try:
+        flag_mutations_total.labels(action="updated").inc()
+    except Exception:  # noqa: BLE001
+        pass
+
+    return None
+
