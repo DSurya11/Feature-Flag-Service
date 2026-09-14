@@ -1,8 +1,164 @@
-# Feature Flag Service
+# Feature Flag Service — A Self-Built Internal Developer Platform
 
-Internal FastAPI service for managing and evaluating feature flags across `dev`, `staging`, and `prod` environments.
+## 1. What This Is
+
+A production-style feature flag service (create, evaluate, and roll out flags with
+percentage-based targeting, audit logging, and fail-safe defaults) built end-to-end
+with the full platform around it: containerized, CI/CD'd, provisioned via Terraform,
+deployed to Kubernetes through GitOps (Argo CD), policy-enforced (Kyverno), observable
+(Prometheus/Grafana), and cataloged in a developer portal (Backstage).
+
+The service itself is intentionally modest in scope. The point of this project is the
+platform built around it — every layer here mirrors a real decision a platform
+engineering team makes, made deliberately and documented honestly, including the
+trade-offs, the bugs found along the way, and the things left out on purpose.
+
+## 2. Architecture
+
+```
+Developer
+   │
+   │ git push
+   ▼
+Feature-Flag-Service (app repo)
+   │
+   │ GitHub Actions CI
+   │  ├─ test (ephemeral Postgres + Redis, real Alembic migration from empty DB)
+   │  └─ build & push image → GHCR (tagged by commit SHA)
+   ▼
+feature-flag-service-env-config (env-config repo)
+   │  image tag auto-updated by CI on every push to main
+   ▼
+Argo CD (in-cluster, watching env-config repo)
+   │  automated sync + self-heal
+   ▼
+kind cluster
+   ├─ feature-flag namespace
+   │    ├─ feature-flag-api (2 replicas, non-root, liveness/readiness probes)
+   │    └─ redis (shared cache across replicas)
+   ├─ kyverno namespace (disallow-root-containers policy, enforced)
+   └─ monitoring namespace (kube-prometheus-stack: Prometheus + Grafana)
+
+Neon (Postgres, provisioned via Terraform) ←── feature-flag-api
+
+Backstage (local) ── catalogs feature-flag-service + its Postgres/Redis dependencies
+```
+
+**The loop that matters:** a code change becomes a running, monitored, policy-checked
+pod with zero manual `kubectl apply` — Git is the single source of truth end to end.
+
+## 3. Real Engineering Decisions and Trade-Offs
+
+This section is the actual substance of the project — what was decided, why, and what
+was learned along the way. Each of these was a real design choice or a real bug found
+through verification, not assumed.
+
+### Fail-safe design has three distinct failure modes, handled differently on purpose
+- **Flag doesn't exist** → HTTP 200, `enabled: false`, `reason: flag_not_found`. Never
+  a 404 — a caller shouldn't have to special-case a missing flag as an error.
+- **Redis is down, DB is up** → transparently falls through to Postgres. Never treated
+  as a fail-safe trigger, since the DB still has the real answer. Verified against a
+  real induced Redis outage, including the harder case (targeted flags, which need a
+  DB-backed rule fetch, not just the base flag).
+- **DB is also down (or any unhandled exception)** → HTTP 200, `enabled: <default_value>`,
+  `reason: evaluation_error_fail_safe`. This endpoint never returns a 5xx under any
+  condition — a calling service should never have to handle "the flag service errored"
+  as a special case.
+
+### Redis over in-memory caching — a decision made for a reason that only appears once you scale
+In-memory caching is fine for one replica. The moment `feature-flag-api` runs as
+multiple Kubernetes replicas (Step 10), each pod's own in-memory cache could disagree
+with the others after a flag update. Redis gives every replica one shared, consistent
+view. This was proven concretely, not just argued: 20 `/evaluate` calls against the
+same user/flag, made through Kubernetes' real load-balancing (not port-forward, which
+pins to a single pod), returned identical results — and the pod logs confirmed both
+replicas actually served requests during the test.
+
+### Neon now, Aurora path documented, not taken
+Built and validated entirely on Neon's free tier to keep iteration risk-free. AWS
+Aurora PostgreSQL (also free-tier eligible as of March 2026) was evaluated as the
+"more literal" AWS-hosted alternative, but Neon's zero-expiry, zero-credit-burn nature
+made it the better choice for a project revisited over months. The point: this was a
+weighed, explainable trade-off, not a shortcut — and Terraform's provider abstraction
+means the actual application code is unaffected by which one is chosen.
+
+### CrashLoopBackOff vs. readiness failure — a real distinction the platform surfaced under test
+The plan predicted a broken `DATABASE_URL` would cause a readiness-probe failure
+(`0/1 Ready`, still `Running`). What actually happened was `CrashLoopBackOff`. The
+reason: the app's own Step 2 startup check (`_assert_db_reachable()`) fails fast and
+crashes the process *before* Kubernetes' liveness/readiness probes ever get a chance to
+run — the lenient-vs-strict probe threshold split only governs *runtime* DB failures on
+an already-started pod, not startup failures. The critical thing proven: during this
+failure, Argo CD's rolling update kept the existing healthy pods alive throughout, so
+real traffic was never interrupted — the deployment strategy did its job even though
+the specific failure mode differed from the prediction.
+
+### The Kyverno policy that didn't actually enforce anything, at first
+The first version of the `disallow-root-containers` policy used Kyverno's `=(field)`
+optional-match syntax, which meant every condition passed trivially on a pod with no
+`securityContext` at all — a bare `nginx` pod would have sailed through, silently
+proving nothing. Caught by testing the actual rejection path, not by reading the YAML.
+Fixed by requiring the fields strictly rather than optionally. Lesson: a policy that
+"applies successfully" and a policy that "actually blocks anything" are different
+claims, and only one of them was ever verified.
+
+### The secret-template.yaml GitOps trap
+A committed `secret-template.yaml` — meant purely as human-readable reference,
+containing only `<REPLACE_ME>` placeholders — was picked up by Argo CD as a real
+`kind: Secret` manifest and applied to the cluster, overwriting the actual working
+secret with placeholder values and crashing the pods. Argo CD parses any valid
+Kubernetes YAML in its watched path by its `kind:` field, regardless of filename intent
+or commented-out content. Fixed by renaming the file to `.yaml.example`, removing it
+from manifest-shape entirely rather than relying on comments to suppress it. This is a
+real, non-obvious GitOps failure mode: reference material and real manifests cannot
+safely share a sync path unless the reference material is made structurally
+unrecognizable as a resource.
+
+### Measured latency vs. the original "sub-50ms" target
+The original spec assumed sub-50ms evaluation latency. Measured reality, once
+Prometheus was wired up: **p95 ≈ 0.97s** across 70 real requests, with a uniform
+~500–1000ms distribution (not a few slow outliers — every request was slow). Splitting
+internal timing showed cache lookups took ~0.6ms while the Postgres fetch took
+~750-800ms consistently, including on requests fired in a tight burst with no
+warm-up improvement — ruling out both Redis latency and Neon cold-start. The
+connection string already uses Neon's pooled endpoint (`-pooler` in the hostname), so
+the exact mechanism (TLS renegotiation cost per request vs. a session-lifecycle issue
+preventing effective pool reuse) wasn't fully isolated in this pass — but the finding
+itself is real and instrumented, not assumed, and it's the actual measured answer to a
+requirement that was never previously tested end-to-end. This is arguably the most
+valuable single artifact in the project: real data overturning an untested assumption.
+
+## 4. Known Simplifications
+
+| Simplification | Production equivalent |
+|---|---|
+| Redis: single-replica Deployment, no PV | StatefulSet + PVC + Redis Sentinel/Cluster |
+| Secrets: applied imperatively | External Secrets Operator or Sealed Secrets |
+| No Ingress | ingress-nginx or cloud load balancer |
+| Liveness uses `/health` (DB check) | Separate `/livez` endpoint (process-only check) |
+| Kyverno uses deprecated `v1 ClusterPolicy` | Migrate to CEL-based `policies.kyverno.io` API |
+| `/metrics` Prometheus endpoint has no auth | Firewalled to cluster-internal traffic via NetworkPolicy |
+| Audit log history for deleted flags is 404 | Redundant `name` lookup for historical queries |
+| Local Terraform state | Remote backend (S3/GCS with locking) |
+
+> **Note on Kyverno Policy:** The Kyverno policy uses the `kyverno.io/v1 ClusterPolicy` API, which Kyverno has marked deprecated in favor of a CEL-expression-based API (`policies.kyverno.io`). The policy is fully functional as-is; migration was deferred as out of scope for this project's timeline.
+
+> **Note on Kyverno Scope:** The `disallow-root-containers` policy excludes the `monitoring` namespace, since `kube-prometheus-stack`'s admission-webhook Jobs run as root by default. This is a standard exemption pattern for system namespaces.
+
+## 5. Running This Project
+
+- **Local Setup:** Check [Setup](#setup) for local `.env` and `uvicorn` setup.
+- **Cluster Deployment:** Check [Step 10 — Kubernetes](#step-10--kubernetes-kind-cluster) for creating the cluster, applying namespaces, and imperatively creating the secrets.
+- **GitOps (Argo CD):** Ensure ArgoCD is installed and the `feature-flag-service-env-config` repo is synced.
+- **Port Forwards:**
+  - Argo CD UI: `kubectl port-forward svc/argocd-server -n argocd 8080:443`
+  - Grafana UI: `kubectl port-forward svc/kube-prometheus-stack-grafana -n monitoring 3001:80`
+  - Backstage UI: `yarn start` (on `localhost:3000` in the `idp-portal` directory)
+  - API: `kubectl port-forward svc/feature-flag-api -n feature-flag 8000:8000`
 
 ---
+
+## 6. Detailed Documentation
 
 ## Setup
 
@@ -16,8 +172,6 @@ uvicorn app.main:app --reload
 ```
 
 Swagger UI: [http://localhost:8000/docs](http://localhost:8000/docs)
-
----
 
 ## API Overview
 
@@ -35,8 +189,6 @@ Swagger UI: [http://localhost:8000/docs](http://localhost:8000/docs)
 | `POST`   | `/evaluate`              | any     | Evaluate a flag for a user               |
 | `GET`    | `/metrics`               | **none**| Prometheus metrics (no auth — see below) |
 
----
-
 ## Flag Types
 
 | `flag_type`    | `rollout_percentage` | Notes                                         |
@@ -44,8 +196,6 @@ Swagger UI: [http://localhost:8000/docs](http://localhost:8000/docs)
 | `boolean`      | must be absent       | Simple on/off flag                            |
 | `targeted`     | must be absent       | Evaluated against targeting rules             |
 | `percentage`   | **required** (0–100) | Deterministic hash-based rollout              |
-
----
 
 ## Audit Log
 
@@ -55,14 +205,6 @@ Every mutation (`POST`, `PATCH`, `DELETE`) writes an `audit_log` row atomically 
 - `actor` — username of the authenticated user
 - `old_value` — JSON snapshot of the flag state before the change (`null` for `created`)
 - `new_value` — JSON snapshot after the change (`null` for `deleted`)
-
-### Known Limitation — Deleted-flag audit history
-
-When a flag is deleted, the database's `ON DELETE SET NULL` constraint sets `audit_log.flag_id = NULL` on all audit rows for that flag (including the `deleted` entry). Because `GET /flags/{id}/history` queries by `flag_id`, it cannot retrieve history for deleted flags — it will return HTTP 404 since the flag no longer exists.
-
-The audit rows **are** preserved in the database with `flag_id = NULL`; they are simply not queryable through this endpoint. A future extension could store the flag `name` redundantly on each audit row to enable lookup by name post-deletion. This is a known design trade-off, not a bug.
-
----
 
 ## Observability — Prometheus Metrics (`GET /metrics`)
 
@@ -75,32 +217,6 @@ The service exposes four Prometheus metrics at `GET /metrics` in standard text e
 | `flag_evaluation_duration_seconds` | Histogram | _(none)_ | Are we meeting the sub-50ms latency requirement? |
 | `flag_mutations_total` | Counter | `action` (`created`\|`updated`\|`deleted`) | How much flag churn is happening? Useful for incident correlation. |
 
-### `/metrics` Auth — Deliberate No-Auth Decision
-
-`GET /metrics` requires **no authentication**. This is an explicit, deliberate scope decision:
-
-- Prometheus's scraper is a separate infrastructure component that cannot hold a JWT and operates on a fixed scrape interval.
-- Forcing auth here would require a second auth mechanism (e.g. a static bearer token) just for the scraper — out of scope for this portfolio project.
-- In a real production deployment, the `/metrics` port would be firewalled to cluster-internal traffic only (network policy, not application-layer auth), which is the standard Kubernetes pattern for Prometheus scraping.
-
-This mirrors the `/evaluate` auth limitation note: both are real production gaps that are documented explicitly rather than silently ignored.
-
----
-
-## Performance Findings
-
-Real measured p95 latency for `/evaluate` came in at ~0.97s across 70 sampled requests — dramatically above the original sub-50ms target. 
-
-By splitting the internal timing in a debug deployment, we confirmed the exact root cause:
-- **Cache lookups (Redis)** take ~0.6 milliseconds.
-- **Database fetches (Neon Postgres)** take ~750ms-800ms on every single request.
-
-Every request paid the full ~780ms connection-establishment cost uniformly, with no warm-up improvement across a tight burst — indicating the connection pool isn't being effectively reused between requests, despite SQLAlchemy's default `QueuePool` being in place. The exact mechanism wasn't fully isolated in this pass, but the `-pooler` hostname in the `DATABASE_URL` confirms we are already routing through Neon's built-in PgBouncer endpoint. This suggests the overhead might be tied to per-connection SSL/TLS negotiation costs, or a session lifecycle issue preventing the pool from maintaining warm connections. The cache is blazing fast, but the underlying DB round-trip is the confirmed bottleneck. 
-
-This is a genuinely useful finding: it's the actual measured answer to the original spec's "sub-50ms" requirement, and it demonstrates exactly why that requirement needs real instrumentation to verify rather than being assumed.
-
----
-
 ## Error Responses
 
 | Scenario                              | HTTP Status | Notes                                      |
@@ -111,15 +227,11 @@ This is a genuinely useful finding: it's the actual measured answer to the origi
 | Duplicate `(name, environment)` pair  | 409         | DB `IntegrityError` translated, never 500  |
 | Pydantic / cross-field validation     | 422         | FastAPI default; validator message included|
 
----
-
 ## Cascade Behaviour (Step 1 schema)
 
 - `targeting_rules` → `ON DELETE CASCADE`: deleting a flag removes all its targeting rules automatically.
 - `audit_log.flag_id` → `ON DELETE SET NULL`: audit history is **preserved** after flag deletion; `flag_id` becomes `NULL`.
 - `audit_log.actor` stores the username string (not a FK) so history survives user-account deletion.
-
----
 
 ## Project Structure
 
@@ -151,8 +263,6 @@ feature-flag-service/
 ├── requirements.txt
 └── docker-compose.yml
 ```
-
----
 
 ## Step 10 — Kubernetes (`kind` cluster)
 
@@ -285,25 +395,9 @@ Both probes target `GET /health` (returns 503 when DB is unreachable):
 
 **Known simplification:** a production setup would have a separate `/livez` endpoint that checks only process health (not DB connectivity) for liveness. The lenient-threshold approach is the honest trade-off for a portfolio project — documented here rather than hidden.
 
-### Known simplifications
-
-| Simplification | Production equivalent |
-|---|---|
-| Redis: single-replica Deployment, no PV | StatefulSet + PVC + Redis Sentinel/Cluster |
-| Secrets: applied imperatively | External Secrets Operator or Sealed Secrets |
-| No Ingress | ingress-nginx or cloud load balancer |
-| Liveness uses `/health` (DB check) | Separate `/livez` endpoint (process-only check) |
-| Kyverno uses deprecated `v1 ClusterPolicy` | Migrate to CEL-based `policies.kyverno.io` API |
-
-> **Note on Kyverno Policy:** The Kyverno policy uses the `kyverno.io/v1 ClusterPolicy` API, which Kyverno has marked deprecated in favor of a CEL-expression-based API (`policies.kyverno.io`). The policy is fully functional as-is; migration was deferred as out of scope for this project's timeline.
-
-> **Kyverno policy scope:** The `disallow-root-containers` policy excludes the `monitoring` namespace, since `kube-prometheus-stack`'s admission-webhook Jobs run as root by default. This is a standard, common exemption pattern for system/infra namespaces — the policy remains fully enforced for the application namespace (`feature-flag`), which is what it was designed to protect.
-
 ## Step 11 — Terraform
 
 Terraform manages the existing Neon project via `terraform import`, adopting an already-provisioned resource rather than creating a new one — this mirrors real-world 'brownfield' infrastructure adoption. Terraform state is stored locally for this project; a production setup would use a remote backend (e.g. Terraform Cloud or S3 with locking) for team/CI use. Terraform's scope here covers the Neon project itself; a full AWS RDS-based setup would additionally require VPC, subnet, and security-group resources, which are out of scope given the Neon-based architecture chosen in Step 1 for cost reasons.
-
----
 
 ## Step 13 — GitOps (Argo CD)
 
@@ -311,15 +405,3 @@ Argo CD handles automated synchronization of Kubernetes manifests from the `feat
 
 - **Automated Sync & Prune:** If a manifest is deleted from Git, the resource is deleted from the cluster.
 - **Self-Healing:** Manual drifts (e.g., `kubectl scale deployment ... --replicas=5`) are automatically detected and reverted back to the Git-declared state (e.g., `replicas: 2`).
-
-### ⚠️ GitOps Failure Mode Lesson: The Secret Template Trap
-
-During initial GitOps deployment, a critical failure mode was observed: the pods crashed with `CreateContainerConfigError` due to missing valid secrets, even though real secrets were manually created in the cluster (as per the *Secrets strategy* in Step 10). 
-
-**What went wrong:** 
-The repository contained a file named `secret-template.yaml` intended only for documentation. However, because the file contained valid YAML with `kind: Secret`, Argo CD parsed it as a real manifest. It synced the template into the cluster, silently overwriting the real application secrets with `<REPLACE_ME>` placeholder values.
-
-**The Lesson:**
-Argo CD's manifest scanner looks at the contents of the files in its watched path, not the filenames. Anything with a valid Kubernetes `kind:` is treated as a target state to enforce. 
-**Fixing this:** Renaming the file to `secret-template.yaml.example` prevents Argo CD from parsing it as a `.yaml` manifest, effectively defusing the trap. This is a common GitOps pitfall where documentation or local test manifests inadvertently destroy production state if left in the sync path.
-
