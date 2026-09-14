@@ -283,6 +283,8 @@ Both probes target `GET /health` (returns 503 when DB is unreachable):
 
 > **Note on Kyverno Policy:** The Kyverno policy uses the `kyverno.io/v1 ClusterPolicy` API, which Kyverno has marked deprecated in favor of a CEL-expression-based API (`policies.kyverno.io`). The policy is fully functional as-is; migration was deferred as out of scope for this project's timeline.
 
+> **Kyverno policy scope:** The `disallow-root-containers` policy excludes the `monitoring` namespace, since `kube-prometheus-stack`'s admission-webhook Jobs run as root by default. This is a standard, common exemption pattern for system/infra namespaces — the policy remains fully enforced for the application namespace (`feature-flag`), which is what it was designed to protect.
+
 ## Step 11 — Terraform
 
 Terraform manages the existing Neon project via `terraform import`, adopting an already-provisioned resource rather than creating a new one — this mirrors real-world 'brownfield' infrastructure adoption. Terraform state is stored locally for this project; a production setup would use a remote backend (e.g. Terraform Cloud or S3 with locking) for team/CI use. Terraform's scope here covers the Neon project itself; a full AWS RDS-based setup would additionally require VPC, subnet, and security-group resources, which are out of scope given the Neon-based architecture chosen in Step 1 for cost reasons.
