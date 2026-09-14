@@ -279,6 +279,9 @@ Both probes target `GET /health` (returns 503 when DB is unreachable):
 | Secrets: applied imperatively | External Secrets Operator or Sealed Secrets |
 | No Ingress | ingress-nginx or cloud load balancer |
 | Liveness uses `/health` (DB check) | Separate `/livez` endpoint (process-only check) |
+| Kyverno uses deprecated `v1 ClusterPolicy` | Migrate to CEL-based `policies.kyverno.io` API |
+
+> **Note on Kyverno Policy:** The Kyverno policy uses the `kyverno.io/v1 ClusterPolicy` API, which Kyverno has marked deprecated in favor of a CEL-expression-based API (`policies.kyverno.io`). The policy is fully functional as-is; migration was deferred as out of scope for this project's timeline.
 
 ## Step 11 — Terraform
 
