@@ -390,7 +390,11 @@ def evaluate_flag(
         # ------------------------------------------------------------------ #
         # Step 1: try cache                                                    #
         # ------------------------------------------------------------------ #
+        import time
+        t_cache_start = time.perf_counter()
         flag_data, cache_status = get_cached_flag_with_status(flag_name, environment)
+        t_cache_elapsed = time.perf_counter() - t_cache_start
+        logger.info(f"TIMING cache_lookup={t_cache_elapsed:.4f}s status={cache_status}")
 
         # Increment cache result counter — wrapped so it can never raise.
         try:
@@ -402,7 +406,10 @@ def evaluate_flag(
         # Step 2: cache miss (or Redis down) — fetch from Postgres            #
         # ------------------------------------------------------------------ #
         if flag_data is None:
+            t_db_start = time.perf_counter()
             flag_data = _fetch_flag_data_from_db(db, flag_name, environment)
+            t_db_elapsed = time.perf_counter() - t_db_start
+            logger.info(f"TIMING db_fetch={t_db_elapsed:.4f}s")
 
             if flag_data is None:
                 logger.info(
