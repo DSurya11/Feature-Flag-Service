@@ -1,69 +1,51 @@
 # =============================================================================
 # .github/workflows/ci.yml — Feature Flag Service CI
 #
-# Two jobs:
-#   1. test          — runs on every push and every PR (all branches)
+# Three jobs:
+#   1. test           — runs on every push and every PR (all branches)
 #   2. build-and-push — runs only on push to main, only after test passes
+#                       pushes to ECR (not GHCR), SHA tag only (no :latest)
+#                       runs Trivy vulnerability scan (fails on HIGH/CRITICAL)
+#   3. update-env-config — updates overlays/dev/kustomization.yaml in env-config
+#                           repo with the new image SHA, using a short-lived
+#                           GitHub App installation token (no long-lived PAT)
 #
-# Test database strategy: Option A — ephemeral service containers.
-#   - Postgres and Redis are spun up fresh inside the GitHub Actions runner for
-#     the duration of the job, then torn down.  No real Neon credentials are
-#     needed here; no real data is at risk.  The JWT_SECRET_KEY used is
-#     throwaway and never protects anything real.
-#   - The trade-off chosen explicitly: ephemeral containers are NOT literally
-#     Neon, but this service uses no Neon-specific features (standard Postgres
-#     throughout), so the difference is irrelevant in practice.
-#   - Real Neon DATABASE_URL only becomes relevant in Step 10+ (Kubernetes
-#     secrets for the actual deployed environment).  If you ever find yourself
-#     adding DATABASE_URL as a GitHub secret for this job, stop — that would
-#     mean Option B was silently chosen instead.
+# Auth strategy (zero static credentials):
+#   AWS access:    OIDC → IAM role ff-idp-github-ci (no AWS_ACCESS_KEY_ID anywhere)
+#   env-config writes: GitHub App installation token generated per-run
+#                      via actions/create-github-app-token@v1
+#                      (App: ff-idp-ci-bot, registered under DSurya11)
 #
-# GHCR image tagging strategy:
-#   - Primary tag: git commit SHA — immutable, always traceable to exact source.
-#   - Convenience tag: `latest` — mutable, fine for local pulls.
-#   - Argo CD (Step 10+) should reference the SHA tag, never `latest`, since
-#     `latest` can silently point to a different image after each push.  This
-#     is standard GitOps practice: the deployment manifest pins an exact digest,
-#     not a moving tag.
+# Image tagging strategy:
+#   ECR registry:  693906847772.dkr.ecr.ap-south-1.amazonaws.com/feature-flag-service
+#   Tag:           git commit SHA only — no :latest tag ever
+#   Immutability:  enforced at ECR registry level (tag cannot be overwritten)
+#   Reason:        :latest is a mutable pointer that silently shifts after every
+#                  push. In a GitOps deployment manifest, :latest defeats the
+#                  entire point of having an immutable reference.
 # =============================================================================
 
 name: CI
 
 on:
   push:
-    # Run tests on every push to any branch.
-    # build-and-push is gated to main only (see that job's `if:` condition).
     branches: ["**"]
   pull_request:
-    # Also run tests on PRs targeting any branch.
     branches: ["**"]
 
 # ---------------------------------------------------------------------------
 # Job 1 — test
-# Runs on every push and every pull_request.
-# Uses ephemeral Postgres + Redis service containers (Option A decision above).
+# Runs on every push and every pull_request. Unchanged from Steps 1-16.
 # ---------------------------------------------------------------------------
 jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
 
-    # -------------------------------------------------------------------------
-    # Service containers — these run as sibling containers alongside the job's
-    # runner container.  GitHub Actions exposes them on `localhost` inside the
-    # runner via the mapped ports.  They are torn down automatically when the
-    # job finishes.
-    #
-    # Health checks are required — without them, steps that run immediately
-    # after the job starts could attempt to connect before the container is
-    # ready, producing spurious connection-refused failures.  This is the same
-    # reasoning as `depends_on: condition: service_healthy` in docker-compose.
-    # -------------------------------------------------------------------------
     services:
       postgres:
         image: postgres:16
         env:
-          # Throwaway credentials — this DB only exists for the duration of the run.
           POSTGRES_USER: ci
           POSTGRES_PASSWORD: ci
           POSTGRES_DB: feature_flags_ci
@@ -76,7 +58,6 @@ jobs:
           --health-retries 5
 
       redis:
-        # Same tag used in docker-compose.yml — consistent across local dev and CI.
         image: redis:7-alpine
         ports:
           - 6379:6379
@@ -87,186 +68,185 @@ jobs:
           --health-retries 5
 
     steps:
-      # Step 1 — Checkout the code at the ref that triggered this workflow.
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Step 2 — Set up Python, pinned to the same minor version as the
-      # Dockerfile (python:3.12-slim), so CI and the built image use identical
-      # interpreter behaviour.
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      # Step 3 — Install runtime + dev dependencies.
-      # requirements.txt — runtime deps, same as what the Dockerfile installs.
-      # requirements-dev.txt — test-only deps (pytest, httpx for TestClient).
-      # These are split so the Dockerfile never installs pytest into the image.
       - name: Install runtime dependencies
         run: pip install --no-cache-dir -r requirements.txt
 
       - name: Install dev/test dependencies
         run: pip install --no-cache-dir -r requirements-dev.txt
 
-      # Step 4 — Provide environment variables for this job.
-      # These point at the ephemeral service containers defined above.
-      # GITHUB_ENV persists these into all subsequent steps in this job.
-      #
-      # IMPORTANT: JWT_SECRET_KEY here is explicitly throwaway — it never
-      # protects a real deployed environment, so it does not need to be a
-      # GitHub secret.  Real secrets belong in Kubernetes (Step 10+), not here.
       - name: Set environment variables
         run: |
           echo "DATABASE_URL=postgresql://ci:ci@localhost:5432/feature_flags_ci" >> $GITHUB_ENV
           echo "REDIS_URL=redis://localhost:6379" >> $GITHUB_ENV
           echo "JWT_SECRET_KEY=ci-throwaway-key-not-used-in-production" >> $GITHUB_ENV
           echo "ACCESS_TOKEN_EXPIRE_MINUTES=30" >> $GITHUB_ENV
-          # PYTHONPATH=. makes `from app.xxx import ...` resolvable from the
-          # project root.  Without this, pytest on the CI runner cannot find
-          # the `app` package because it isn't installed — it's just a directory.
-          # This matches what happens locally when pytest is run from the repo root.
           echo "PYTHONPATH=$GITHUB_WORKSPACE" >> $GITHUB_ENV
 
-      # Step 5 — Run Alembic migrations against the fresh, empty ephemeral
-      # Postgres.  This is a dual-purpose step:
-      #   a) It sets up the schema so subsequent tests have tables to work with.
-      #   b) It is itself a test of the migration files — proving they apply
-      #      cleanly to a genuinely empty database, not one that already had
-      #      schema from a previous Alembic run (as Neon did after Step 1).
-      #      If this step fails, it means a migration has an implicit dependency
-      #      on pre-existing state that Alembic's own history doesn't capture —
-      #      a real bug worth catching here rather than when someone else clones
-      #      this repo.
       - name: Run Alembic migrations
         run: alembic upgrade head
 
-      # Step 6 — Run the full pytest suite.
-      # pytest exits non-zero on any failure by default; we do not add any
-      # shell pipes or redirects here that could mask that exit code.
-      # -v gives per-test output in the Actions log for easier debugging.
-      # --tb=short keeps tracebacks readable without flooding the log.
       - name: Run tests
         run: pytest tests/ -v --tb=short
 
   # ---------------------------------------------------------------------------
   # Job 2 — build-and-push
-  # Runs ONLY on push to main, AND only after the test job passes.
-  #
-  # The `needs: test` line is the single most important property of the whole
-  # pipeline: a red test run makes it structurally impossible to produce a new
-  # image.  The job won't even start if `test` failed; it appears as "skipped"
-  # in the Actions UI, not "attempted and failed".
-  #
-  # The `if:` condition independently gates on the branch — even if somehow
-  # `needs` were removed, a PR push would not trigger a push to GHCR.
+  # Runs ONLY on push to main, only after test passes.
+  # Pushes to ECR using OIDC (no static AWS credentials).
   # ---------------------------------------------------------------------------
   build-and-push:
-    name: Build and Push to GHCR
+    name: Build and Push to ECR
     runs-on: ubuntu-latest
     needs: test
-    # Only runs on direct pushes to main — not on pull_request events (those
-    # don't push images; we don't want an image per draft feature commit) and
-    # not on pushes to other branches.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
-    # -------------------------------------------------------------------------
-    # Explicit permissions declaration — required for GHCR push.
-    # Without `packages: write` here, the built-in GITHUB_TOKEN does not have
-    # permission to push to the GitHub Container Registry, even though the
-    # token itself exists automatically.  This is a deliberate GitHub security
-    # model: jobs must opt in to elevated permissions rather than having them
-    # by default.
-    # -------------------------------------------------------------------------
     permissions:
+      id-token: write  # REQUIRED for OIDC token request
       contents: read
-      packages: write
+
+    outputs:
+      # Pass the SHA to the update-env-config job so it can update the manifest
+      image_tag: ${{ steps.meta.outputs.image_tag }}
 
     steps:
-      # Step 1 — Checkout, same as test job.
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Step 2 — Log in to GHCR using the automatically-provided GITHUB_TOKEN.
-      # No separate secret is needed: the built-in token already has the right
-      # scope for GHCR when `permissions: packages: write` is set above.
-      # The registry is ghcr.io; the username is the GitHub actor who triggered
-      # the push; the password is the built-in token.
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+      # Authenticate to AWS via OIDC — no static credentials.
+      # The IAM role trust policy is scoped to exactly:
+      #   repo:DSurya11/Feature-Flag-Service:ref:refs/heads/main
+      # Any other repo or branch cannot assume this role.
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          role-to-assume: arn:aws:iam::693906847772:role/ff-idp-github-ci
+          aws-region: ap-south-1
 
-      # Step 3 — Derive image name and tags.
-      #
-      # Image name convention: ghcr.io/<owner>/<repo>
-      # github.repository is already "<owner>/<repo>", so we lowercase it
-      # (GHCR requires lowercase image names) and prepend "ghcr.io/".
-      #
-      # Tags produced:
-      #   ghcr.io/<owner>/<repo>:<sha>   <- primary, immutable, deployment-safe
-      #   ghcr.io/<owner>/<repo>:latest  <- convenience only, NOT for Argo CD
-      #
-      # The SHA tag is what Argo CD (Step 10+) should reference in the
-      # Deployment manifest's image field.  `latest` is convenient for
-      # `docker pull` locally but silently shifts after every push — using it
-      # in a GitOps deployment manifest defeats the entire point of immutable
-      # image references.
-      - name: Derive image name and tags
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Derive image metadata
         id: meta
+        env:
+          ECR_REGISTRY: 693906847772.dkr.ecr.ap-south-1.amazonaws.com
+          ECR_REPOSITORY: feature-flag-service
         run: |
-          IMAGE_NAME="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
-          SHA_TAG="${IMAGE_NAME}:${{ github.sha }}"
-          LATEST_TAG="${IMAGE_NAME}:latest"
-          echo "image_name=${IMAGE_NAME}" >> $GITHUB_OUTPUT
-          echo "sha_tag=${SHA_TAG}" >> $GITHUB_OUTPUT
-          echo "latest_tag=${LATEST_TAG}" >> $GITHUB_OUTPUT
-          echo "sha=${{ github.sha }}" >> $GITHUB_OUTPUT
+          IMAGE_TAG="${{ github.sha }}"
+          FULL_IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "full_image=${FULL_IMAGE}" >> $GITHUB_OUTPUT
+          echo "ecr_registry=${ECR_REGISTRY}" >> $GITHUB_OUTPUT
+          echo "ecr_repository=${ECR_REPOSITORY}" >> $GITHUB_OUTPUT
 
-      # Step 4 — Build the image using the multi-stage Dockerfile from Step 8.
-      # We build once, producing a local image with both tags, then push both
-      # in step 5.  Building once avoids any possibility of a tag pointing to
-      # a different build than the other.
       - name: Build Docker image
         run: |
           docker build \
-            --tag "${{ steps.meta.outputs.sha_tag }}" \
-            --tag "${{ steps.meta.outputs.latest_tag }}" \
+            --tag "${{ steps.meta.outputs.full_image }}" \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
             .
 
-      # Step 5 — Push both tags to GHCR.
-      # After this step, the image is visible in your GitHub repo's Packages
-      # tab.  The SHA-tagged image is what a deployment system should reference.
-      - name: Push Docker image to GHCR
+      # Push BEFORE Trivy scan: ECR scan-on-push fires asynchronously.
+      # We push first, then run Trivy as an explicit gate with exit-code: '1'.
+      # If Trivy finds HIGH/CRITICAL, the workflow fails — the image is in ECR
+      # but update-env-config (next job) depends on this job succeeding, so
+      # a vulnerable image never propagates to the deployment manifest.
+      - name: Push Docker image to ECR (SHA tag only)
         run: |
-          docker push "${{ steps.meta.outputs.sha_tag }}"
-          docker push "${{ steps.meta.outputs.latest_tag }}"
+          docker push "${{ steps.meta.outputs.full_image }}"
+          echo "Pushed: ${{ steps.meta.outputs.full_image }}"
+          echo "NOTE: No :latest tag — SHA-only is the rule for this project."
 
-      # Step 6 — Print a summary of what was pushed for easy reference in the
-      # Actions log.  The SHA tag is the one to copy for Argo CD / kubectl.
-      - name: Print image references
+      # Trivy scans the just-pushed image. Fails the job on HIGH or CRITICAL findings.
+      # This means a vulnerable image is in ECR but NEVER gets deployed (next job
+      # depends on this one). The image can be manually deleted from ECR.
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.meta.outputs.full_image }}
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+
+      - name: Print image reference
         run: |
-          echo "===== Image pushed to GHCR ====="
-          echo "SHA tag (use for deployment):  ${{ steps.meta.outputs.sha_tag }}"
-          echo "Latest tag (convenience only): ${{ steps.meta.outputs.latest_tag }}"
+          echo "===== Image pushed to ECR ====="
+          echo "SHA tag (use for deployment): ${{ steps.meta.outputs.full_image }}"
           echo ""
-          echo "To pull locally:"
-          echo "  docker pull ${{ steps.meta.outputs.sha_tag }}"
-          echo ""
-          echo "NOTE: For Argo CD (Step 10+), reference the SHA tag above —"
-          echo "never the 'latest' tag, which moves on every push."
+          echo "ECR immutability is ENFORCED — this SHA tag cannot be overwritten."
+          echo "To use: reference this exact tag in the deployment manifest."
 
-      - name: Update image tag in env-config repo
+  # ---------------------------------------------------------------------------
+  # Job 3 — update-env-config
+  # Runs after build-and-push succeeds.
+  # Updates overlays/dev/kustomization.yaml with the new image SHA.
+  # Uses a short-lived GitHub App installation token — no long-lived PAT.
+  # ---------------------------------------------------------------------------
+  update-env-config:
+    name: Update env-config (dev overlay)
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Generate GitHub App installation token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          # GitHub App registered under DSurya11 with contents:write on
+          # feature-flag-service-env-config repo only.
+          # App ID and private key are GitHub Actions secrets (not AWS secrets).
+          app-id: ${{ secrets.FF_IDP_CI_BOT_APP_ID }}
+          private-key: ${{ secrets.FF_IDP_CI_BOT_PRIVATE_KEY }}
+          # Scope token to only the env-config repo
+          repositories: feature-flag-service-env-config
+
+      - name: Clone env-config repo
+        run: |
+          git clone https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/DSurya11/feature-flag-service-env-config.git env-config
+
+      # Update the image tag in the dev overlay kustomization.
+      # After Step 27 restructure, this targets overlays/dev/kustomization.yaml.
+      # Until then (flat structure), we fall back to api-deployment.yaml.
+      - name: Update image SHA in env-config
         env:
-          GH_TOKEN: ${{ secrets.ENV_CONFIG_REPO_PAT }}
+          NEW_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+          ECR_IMAGE: 693906847772.dkr.ecr.ap-south-1.amazonaws.com/feature-flag-service
         run: |
-          git clone https://x-access-token:${GH_TOKEN}@github.com/DSurya11/feature-flag-service-env-config.git env-config
           cd env-config
-          sed -i "s|image: ghcr.io/dsurya11/feature-flag-service:.*|image: ghcr.io/dsurya11/feature-flag-service:${{ github.sha }}|" api-deployment.yaml
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add api-deployment.yaml
-          git commit -m "chore: update image to ${{ github.sha }}" || echo "No changes to commit"
+
+          # Detect whether env-config has been restructured (Step 27) or is still flat
+          if [ -f "apps/feature-flag-service/overlays/dev/kustomization.yaml" ]; then
+            echo "==> Kustomize overlay structure detected (post-Step-27)"
+            # Update the newTag field in the kustomization.yaml images stanza
+            sed -i "s|newTag:.*|newTag: ${NEW_TAG}|g" \
+              apps/feature-flag-service/overlays/dev/kustomization.yaml
+            CHANGED_FILE="apps/feature-flag-service/overlays/dev/kustomization.yaml"
+          else
+            echo "==> Flat structure detected (pre-Step-27)"
+            # Update the image field directly in api-deployment.yaml
+            sed -i "s|image: ${ECR_IMAGE}:.*|image: ${ECR_IMAGE}:${NEW_TAG}|g" \
+              api-deployment.yaml
+            CHANGED_FILE="api-deployment.yaml"
+          fi
+
+          git config user.name "ff-idp-ci-bot[bot]"
+          git config user.email "ff-idp-ci-bot[bot]@users.noreply.github.com"
+          git add "${CHANGED_FILE}"
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "chore(deploy): update feature-flag-service image to ${NEW_TAG}"
           git push origin main
+          echo "==> env-config updated: ${CHANGED_FILE} → ${ECR_IMAGE}:${NEW_TAG}"
