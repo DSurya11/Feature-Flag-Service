@@ -146,9 +146,17 @@ jobs:
           echo "ecr_registry=${ECR_REGISTRY}" >> $GITHUB_OUTPUT
           echo "ecr_repository=${ECR_REPOSITORY}" >> $GITHUB_OUTPUT
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Build Docker image
         run: |
-          docker build \
+          docker buildx build \
+            --platform linux/arm64 \
+            --push \
             --tag "${{ steps.meta.outputs.full_image }}" \
             --label "org.opencontainers.image.revision=${{ github.sha }}" \
             --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
@@ -159,11 +167,7 @@ jobs:
       # If Trivy finds HIGH/CRITICAL, the workflow fails — the image is in ECR
       # but update-env-config (next job) depends on this job succeeding, so
       # a vulnerable image never propagates to the deployment manifest.
-      - name: Push Docker image to ECR (SHA tag only)
-        run: |
-          docker push "${{ steps.meta.outputs.full_image }}"
-          echo "Pushed: ${{ steps.meta.outputs.full_image }}"
-          echo "NOTE: No :latest tag — SHA-only is the rule for this project."
+
 
       # Trivy scans the just-pushed image. Fails the job on HIGH or CRITICAL findings.
       # This means a vulnerable image is in ECR but NEVER gets deployed (next job
