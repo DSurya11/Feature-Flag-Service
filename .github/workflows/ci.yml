@@ -84,7 +84,7 @@ jobs:
 
       - name: Set environment variables
         run: |
-          echo "DATABASE_URL=postgresql://ci:ci@localhost:5432/feature_flags_ci" >> $GITHUB_ENV
+          echo "DATABASE_URL=postgresql+psycopg2://ci:ci@localhost:5432/feature_flags_ci" >> $GITHUB_ENV
           echo "REDIS_URL=redis://localhost:6379" >> $GITHUB_ENV
           echo "JWT_SECRET_KEY=ci-throwaway-key-not-used-in-production" >> $GITHUB_ENV
           echo "ACCESS_TOKEN_EXPIRE_MINUTES=30" >> $GITHUB_ENV
