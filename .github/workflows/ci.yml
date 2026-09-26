@@ -156,6 +156,7 @@ jobs:
         run: |
           docker buildx build \
             --platform linux/arm64 \
+            --provenance=false \
             --push \
             --tag "${{ steps.meta.outputs.full_image }}" \
             --label "org.opencontainers.image.revision=${{ github.sha }}" \
@@ -172,6 +173,15 @@ jobs:
       # Trivy scans the just-pushed image. Fails the job on HIGH or CRITICAL findings.
       # This means a vulnerable image is in ECR but NEVER gets deployed (next job
       # depends on this one). The image can be manually deleted from ECR.
+      # The image was pushed by buildx and is not in the runner's local docker daemon,
+      # so Trivy pulls it from ECR. That needs registry credentials, and the image is
+      # arm64 while the runner is amd64, so the platform must be set explicitly.
+      - name: Authenticate Trivy to ECR
+        run: |
+          echo "TRIVY_USERNAME=AWS" >> "$GITHUB_ENV"
+          echo "TRIVY_PASSWORD=$(aws ecr get-login-password --region ap-south-1)" >> "$GITHUB_ENV"
+          echo "TRIVY_PLATFORM=linux/arm64" >> "$GITHUB_ENV"
+
       - name: Trivy vulnerability scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -241,10 +251,11 @@ jobs:
             CHANGED_FILE="apps/feature-flag-service/overlays/dev/kustomization.yaml"
           else
             echo "==> Flat structure detected (pre-Step-27)"
-            # Update the image field directly in api-deployment.yaml
+            # Update the image field directly in eks-api-deployment.yaml
+            # (api-deployment.yaml is the old kind/GHCR manifest and has no ECR image).
             sed -i "s|image: ${ECR_IMAGE}:.*|image: ${ECR_IMAGE}:${NEW_TAG}|g" \
-              api-deployment.yaml
-            CHANGED_FILE="api-deployment.yaml"
+              eks-api-deployment.yaml
+            CHANGED_FILE="eks-api-deployment.yaml"
           fi
 
           git config user.name "ff-idp-ci-bot[bot]"
