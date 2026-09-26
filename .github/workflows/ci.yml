@@ -251,16 +251,16 @@ jobs:
             CHANGED_FILE="apps/feature-flag-service/overlays/dev/kustomization.yaml"
           else
             echo "==> Flat structure detected (pre-Step-27)"
-            # Update the image field directly in eks-api-deployment.yaml
+            # Update the image field in the EKS manifests: the API Deployment and the
+            # DB migration Job must always run the same image.
             # (api-deployment.yaml is the old kind/GHCR manifest and has no ECR image).
-            sed -i "s|image: ${ECR_IMAGE}:.*|image: ${ECR_IMAGE}:${NEW_TAG}|g" \
-              eks-api-deployment.yaml
-            CHANGED_FILE="eks-api-deployment.yaml"
+            CHANGED_FILE="eks-api-deployment.yaml eks-db-migrate-job.yaml"
+            sed -i "s|image: ${ECR_IMAGE}:.*|image: ${ECR_IMAGE}:${NEW_TAG}|g" ${CHANGED_FILE}
           fi
 
           git config user.name "ff-idp-ci-bot[bot]"
           git config user.email "ff-idp-ci-bot[bot]@users.noreply.github.com"
-          git add "${CHANGED_FILE}"
+          git add ${CHANGED_FILE}
           git diff --cached --quiet && echo "No changes to commit" && exit 0
           git commit -m "chore(deploy): update feature-flag-service image to ${NEW_TAG}"
           git push origin main
